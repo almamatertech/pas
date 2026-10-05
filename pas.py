@@ -13,6 +13,7 @@ From a shell:   pas.py <pid> info|page|refs|explain <address>
 pas only reads memory. It never calls functions in the process or writes to it.
 """
 import json
+import os
 import re
 import struct
 import subprocess
@@ -24,40 +25,43 @@ except ImportError:
     sys.path.insert(0, subprocess.run(["xcrun", "lldb", "-P"], capture_output=True, text=True).stdout.strip())
     import lldb
 
-# Struct layouts for builds without debug info for libpas, as shipped builds are. They match the
-# JavaScriptCore in macOS 27.0.1 (26A434), checked against its disassembly and against libpas just
-# before WebKit c8cb35beacac, which later changed pas_heap. Builds with debug info use their own.
-CHECKED_BUILDS = {"E372D8E6-F575-3601-BFF2-6ECD1827918F"}
-LAYOUT = {
-    "pas_heap_config": {"small_segregated_config": 0x38, "medium_segregated_config": 0xf0,
-                        "small_bitfit_config": 0x1a8, "medium_bitfit_config": 0x250, "marge_bitfit_config": 0x2f8},
-    "pas_segregated_page_config": {"base.is_enabled": 0x0, "base.min_align_shift": 0x20, "base.page_size": 0x28,
-                                   "exclusive_payload_offset": 0x88},
-    "pas_bitfit_page_config": {"base.is_enabled": 0x0, "base.min_align_shift": 0x20, "base.page_size": 0x28,
-                               "page_object_payload_offset": 0x70},
-    "pas_fast_megapage_table": {"instances": 0x10000},
-    "pas_fast_megapage_table_impl": {"index_begin": 0x0, "index_end": 0x8, "bits": 0x18},
-    "pas_page_header_table": {"page_size": 0x0, "hashtable": 0x8},
-    "pas_lock_free_read_ptr_ptr_hashtable_table": {"table_size": 0x8, "array": 0x20},
-    "pas_segregated_page": {"is_in_use_for_allocation": 0x1, "object_size": 0x4, "owner": 0x20, "alloc_bits": 0x2c},
-    "pas_bitfit_page": {"owner": 0x4, "bits": 0x10},
-    "pas_segregated_exclusive_view": {"page_boundary": 0x0, "directory": 0x8, "is_owned": 0xb},
-    "pas_bitfit_view": {"page_boundary": 0x0, "directory": 0x8, "is_owned": 0xb},
-    "pas_segregated_size_directory": {"heap": 0x10},
-    "pas_bitfit_directory": {"heap": 0x30},
-    "pas_segregated_heap": {"parent_heap": 0x8},
-    "pas_heap": {"megapage_large_heap": 0x30, "large_heap": 0x48, "type": 0x60, "heap_ref": 0x68},
-    "pas_large_heap": {"is_megapage_heap": 0x14},
-    "bmalloc_type": {"size": 0x0, "name": 0x8},
-    "pas_large_map": {"large_map_hashtable": 0x0, "small_large_map_hashtable": 0x38, "tiny_large_map_hashtable": 0x70},
-    "pas_large_map_hashtable": {"table": 0x0, "table_size": 0x8},
-    "pas_first_level_tiny_large_map_entry": {"hashtable": 0x8},
-    "pas_thread_local_cache_node": {"next": 0x8, "cache": 0x18},
-    "pas_thread_local_cache": {"deallocation_log": 0x0, "deallocation_log_index": 0x320, "node": 0x330,
-                               "thread": 0x348},
+# The libpas struct fields and sizes pas reads, when the build has no debug info to say where they
+# are. tools/offsets.py computes them from a WebKit checkout.
+FIELDS = {
+    "pas_heap_config": ["small_segregated_config", "medium_segregated_config", "small_bitfit_config",
+                        "medium_bitfit_config", "marge_bitfit_config"],
+    "pas_segregated_page_config": ["base.is_enabled", "base.min_align_shift", "base.page_size",
+                                   "exclusive_payload_offset"],
+    "pas_bitfit_page_config": ["base.is_enabled", "base.min_align_shift", "base.page_size",
+                               "page_object_payload_offset"],
+    "pas_fast_megapage_table": ["instances"],
+    "pas_fast_megapage_table_impl": ["index_begin", "index_end", "bits"],
+    "pas_page_header_table": ["page_size", "hashtable"],
+    "pas_lock_free_read_ptr_ptr_hashtable_table": ["table_size", "array"],
+    "pas_segregated_page": ["is_in_use_for_allocation", "object_size", "owner", "alloc_bits"],
+    "pas_bitfit_page": ["owner", "bits"],
+    "pas_segregated_exclusive_view": ["page_boundary", "directory", "is_owned"],
+    "pas_bitfit_view": ["page_boundary", "directory", "is_owned"],
+    "pas_segregated_size_directory": ["heap"],
+    "pas_bitfit_directory": ["heap"],
+    "pas_segregated_heap": ["parent_heap"],
+    "pas_heap": ["megapage_large_heap", "large_heap", "type", "heap_ref"],
+    "pas_large_heap": ["is_megapage_heap"],
+    "bmalloc_type": ["size", "name"],
+    "pas_large_map": ["large_map_hashtable", "small_large_map_hashtable", "tiny_large_map_hashtable"],
+    "pas_large_map_hashtable": ["table", "table_size"],
+    "pas_first_level_tiny_large_map_entry": ["hashtable"],
+    "pas_thread_local_cache_node": ["next", "cache"],
+    "pas_thread_local_cache": ["deallocation_log", "deallocation_log_index", "node", "thread"],
 }
-SIZES = {"bmalloc_type": 0x10, "pas_large_map": 0xc8, "pas_large_map_entry": 0x20, "pas_small_large_map_entry": 0xc,
-         "pas_tiny_large_map_entry": 0x5, "pas_first_level_tiny_large_map_entry": 0x10}
+SIZED = ["bmalloc_type", "pas_large_map", "pas_large_map_entry", "pas_small_large_map_entry",
+         "pas_tiny_large_map_entry", "pas_first_level_tiny_large_map_entry"]
+
+# Offsets for builds without debug info, as shipped builds are, one JSON file per set, generated by
+# tools/offsets.py. Builds with debug info use their own. Each set lists the JavaScriptCore builds
+# it was checked against, and pas picks a set for any other build by checking which one fits its
+# memory.
+OFFSETS_FOLDER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "offsets")
 
 ADDRESS_MASK = (1 << 56) - 1
 TAG_GRANULE = 16
@@ -76,6 +80,17 @@ PAGE_KINDS = {1: ("small segregated", "small_segregated_config"), 2: ("medium se
 HEADER_TABLES = ("medium_segregated", "medium_bitfit", "marge")
 
 
+def load_offsets():
+    """The sets of offsets in offsets/, by file name."""
+    sets = {}
+    if os.path.isdir(OFFSETS_FOLDER):
+        for name in sorted(os.listdir(OFFSETS_FOLDER)):
+            if name.endswith(".json"):
+                with open(os.path.join(OFFSETS_FOLDER, name)) as handle:
+                    sets[name[:-len(".json")]] = json.load(handle)
+    return sets
+
+
 class LayoutError(Exception):
     """pas doesn't know where a libpas field is in this build."""
 
@@ -89,6 +104,7 @@ class Reader:
         self.fields = {}
         self.symbols = {}
         self.debug_info = self.target.FindFirstType("pas_segregated_page").IsValid()
+        self.offsets, self.note = (None, None) if self.debug_info else self.choose_offsets()
         # Core files keep memory but not memory tags, so tags there are unknown rather than absent.
         self.core = "core" in (process.GetPluginName() or "")
         base = self.symbol("pas_compact_heap_reservation_base")
@@ -138,14 +154,14 @@ class Reader:
         return None
 
     def field(self, struct_name, path, optional=False):
-        """Byte offset of a struct field: from debug info when the build has it, else from LAYOUT.
+        """Byte offset of a struct field: from debug info when the build has it, else from offsets/.
         An optional field may not exist in this version of libpas, and then this returns None."""
         key = (struct_name, path)
         if key not in self.fields:
             if self.debug_info:
                 self.fields[key] = self.debug_field(struct_name, path)
             else:
-                self.fields[key] = LAYOUT.get(struct_name, {}).get(path)
+                self.fields[key] = self.sets[self.offsets]["fields"].get(struct_name, {}).get(path)
         if self.fields[key] is None and not optional:
             raise LayoutError(f"don't know where {struct_name}.{path} is in this build")
         return self.fields[key]
@@ -176,7 +192,53 @@ class Reader:
 
     def size(self, struct_name):
         kind = self.debug_type(struct_name) if self.debug_info else None
-        return kind.GetByteSize() if kind else SIZES[struct_name]
+        return kind.GetByteSize() if kind else self.sets[self.offsets]["sizes"][struct_name]
+
+    def choose_offsets(self):
+        """The built-in offsets for a build without debug info: the set pas was checked against for this
+        JavaScriptCore, or else the first that fits its memory. Returns the set's name and a note."""
+        address = self.symbol("bmalloc_heap_config")
+        module = self.target.ResolveLoadAddress(address).GetModule() if address else None
+        uuid = module.GetUUIDString() if module else "unknown"
+        self.sets = load_offsets()
+        if not self.sets:
+            raise LayoutError(f"this JavaScriptCore ({uuid}) has no debug info for libpas, and there's no "
+                              "offsets folder next to pas.py")
+        for name, offsets in self.sets.items():
+            if uuid in offsets.get("builds", []):
+                self.offsets = name
+                return name, None
+        for name in self.sets:
+            self.offsets, self.fields = name, {}
+            if self.offsets_fit():
+                return name, (f"pas hasn't been checked against this JavaScriptCore ({uuid}), so it uses "
+                              f"the {name} offsets, which fit its memory")
+        raise LayoutError(f"no built-in offsets fit this JavaScriptCore ({uuid}). Generate them from the "
+                          "matching WebKit source with tools/offsets.py")
+
+    def offsets_fit(self):
+        """Whether the current offsets fit this process. These checks hold in every libpas and fail
+        with wrong offsets: a static heap points at its type, a thread cache points back at its node, and
+        page sizes are powers of two."""
+        try:
+            heap, heap_type = self.symbol("bmalloc_common_primitive_heap"), self.symbol("bmalloc_common_primitive_type")
+            if heap and heap_type and self.u64(heap + self.field("pas_heap", "type")) != heap_type:
+                return False
+            first = self.symbol("pas_thread_local_cache_node_first")
+            node = self.u64(first) if first else 0
+            cache = self.u64(node + self.field("pas_thread_local_cache_node", "cache")) if node else 0
+            if cache and self.u64(cache + self.field("pas_thread_local_cache", "node")) != node:
+                return False
+            config = self.symbol("bmalloc_heap_config")
+            for member, struct_name in (("small_segregated_config", "pas_segregated_page_config"),
+                                        ("small_bitfit_config", "pas_bitfit_page_config")):
+                base = config + self.field("pas_heap_config", member)
+                size = self.u64(base + self.field(struct_name, "base.page_size"))
+                if self.u8(base + self.field(struct_name, "base.is_enabled")) and (size < 4096 or size & (size - 1)):
+                    return False
+            return True
+        except (LookupError, LayoutError):
+            return False
 
     def tags(self, begin, end):
         """Memory tags of the 16-byte granules in [begin, end), or None if the memory isn't tagged."""
@@ -847,22 +909,11 @@ SHELL_USAGE = ("usage: pas.py <pid> info|page|refs|explain <address>, pas.py <pi
                "or pas.py <pid> dump [--page] <address> <file>")
 
 
-def check_build(reader, out):
-    if reader.debug_info:
-        return
-    address = reader.symbol("bmalloc_heap_config")
-    module = reader.target.ResolveLoadAddress(address).GetModule() if address else None
-    uuid = module.GetUUIDString() if module else "unknown"
-    if uuid not in CHECKED_BUILDS:
-        out.append(f"note: no libpas debug info, and pas hasn't been checked against this "
-                   f"JavaScriptCore ({uuid}), "
-                   "so it assumes the layouts of the macOS 27.0.1 JavaScriptCore")
-
-
 def run(target, process, command, arguments, out):
     try:
         reader = Reader(target, process)
-        check_build(reader, out)
+        if reader.note:
+            out.append(f"note: {reader.note}")
         COMMANDS[command][0](Libpas(reader), arguments, out)
     except (LookupError, LayoutError, OSError) as error:
         out.append(f"error: {error}")

@@ -1,0 +1,109 @@
+{
+  "source": "814bf42b6770",
+  "builds": [],
+  "fields": {
+    "pas_heap_config": {
+      "small_segregated_config": 56,
+      "medium_segregated_config": 240,
+      "small_bitfit_config": 424,
+      "medium_bitfit_config": 592,
+      "marge_bitfit_config": 760
+    },
+    "pas_segregated_page_config": {
+      "base.is_enabled": 0,
+      "base.min_align_shift": 32,
+      "base.page_size": 40,
+      "exclusive_payload_offset": 136
+    },
+    "pas_bitfit_page_config": {
+      "base.is_enabled": 0,
+      "base.min_align_shift": 32,
+      "base.page_size": 40,
+      "page_object_payload_offset": 112
+    },
+    "pas_fast_megapage_table": {
+      "instances": 65536
+    },
+    "pas_fast_megapage_table_impl": {
+      "index_begin": 0,
+      "index_end": 8,
+      "bits": 24
+    },
+    "pas_page_header_table": {
+      "page_size": 0,
+      "hashtable": 8
+    },
+    "pas_lock_free_read_ptr_ptr_hashtable_table": {
+      "table_size": 8,
+      "array": 32
+    },
+    "pas_segregated_page": {
+      "is_in_use_for_allocation": 1,
+      "object_size": 4,
+      "owner": 32,
+      "alloc_bits": 44
+    },
+    "pas_bitfit_page": {
+      "owner": 4,
+      "bits": 16
+    },
+    "pas_segregated_exclusive_view": {
+      "page_boundary": 0,
+      "directory": 8,
+      "is_owned": 11
+    },
+    "pas_bitfit_view": {
+      "page_boundary": 0,
+      "directory": 8,
+      "is_owned": 11
+    },
+    "pas_segregated_size_directory": {
+      "heap": 16
+    },
+    "pas_bitfit_directory": {
+      "heap": 48
+    },
+    "pas_segregated_heap": {
+      "parent_heap": 8
+    },
+    "pas_heap": {
+      "large_heap": 48,
+      "type": 72,
+      "heap_ref": 80
+    },
+    "bmalloc_type": {
+      "size": 0,
+      "name": 8
+    },
+    "pas_large_map": {
+      "large_map_hashtable": 0,
+      "small_large_map_hashtable": 56,
+      "tiny_large_map_hashtable": 112
+    },
+    "pas_large_map_hashtable": {
+      "table": 0,
+      "table_size": 8
+    },
+    "pas_first_level_tiny_large_map_entry": {
+      "hashtable": 8
+    },
+    "pas_thread_local_cache_node": {
+      "next": 8,
+      "cache": 24
+    },
+    "pas_thread_local_cache": {
+      "deallocation_log": 0,
+      "deallocation_log_index": 800,
+      "node": 816,
+      "thread": 840
+    }
+  },
+  "sizes": {
+    "bmalloc_type": 16,
+    "pas_large_map": 200,
+    "pas_large_map_entry": 32,
+    "pas_small_large_map_entry": 12,
+    "pas_tiny_large_map_entry": 5,
+    "pas_first_level_tiny_large_map_entry": 16
+  }
+}

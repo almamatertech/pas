@@ -50,7 +50,7 @@ build_app() { # build_app <entitlements>
 }
 
 start_app() { # start_app [mode]
-    DYLD_FRAMEWORK_PATH="$build" "$work/app" "$@" > "$work/addresses.txt" &
+    DYLD_FRAMEWORK_PATH="${frameworks:-$build}" "$work/app" "$@" > "$work/addresses.txt" &
     pid=$!
     while [ "$(wc -l < "$work/addresses.txt")" -lt 6 ]; do sleep 0.1; done
 }
@@ -124,5 +124,21 @@ assert int.from_bytes(data[8:16], "little") & mask == int(sys.argv[2], 16) & mas
         done
     fi
 done
+
+if [ -n "$build" ]; then
+    # Without debug info, pas falls back to built-in offsets, picked by checking which set fits.
+    echo "== plain, without debug info ($build)"
+    frameworks="$work/stripped"
+    mkdir -p "$frameworks"
+    cp -R "$build/JavaScriptCore.framework" "$frameworks/"
+    strip -S "$frameworks/JavaScriptCore.framework/Versions/A/JavaScriptCore" 2> /dev/null
+    codesign -s - -f "$frameworks/JavaScriptCore.framework" 2> /dev/null
+    build_app plain
+    start_app
+    check info small "offsets, which fit its memory" "Common Primitive (bmalloc)" "bytes, allocated"
+    check refs small "(1 found)"
+    check heap "" "Common Primitive" "total"
+    stop_app
+fi
 
 [ "$failures" -eq 0 ] && echo "all checks passed" || { echo "$failures checks failed"; exit 1; }
