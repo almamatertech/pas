@@ -139,6 +139,10 @@ current thread stopped at. To load `pas` in every session, add the `command scri
 `~/.lldbinit`. To run it as `pas`, link it onto your `PATH` with
 `ln -s "$PWD/pas.py" /usr/local/bin/pas`.
 
+`pas` also works on core files. Load one with `lldb -c <core> <program>` and import `pas` as above.
+macOS core files keep memory but not memory tags, so there `pas` shows tags as unknown and
+`explain` can't compare them.
+
 ## Requirements
 
 - macOS with Xcode or the Command Line Tools. `pas` runs on the Python that comes with LLDB.
@@ -166,7 +170,6 @@ libpas layouts change between releases.
 
 ## Limits
 
-- Live processes only, no core files.
 - `pas` covers the `bmalloc` and `tagged_bmalloc` heaps, where `fastMalloc`, TZone and most of
   WebKit's C++ objects live. Other memory (system malloc, the JIT heap, JavaScript objects in
   JavaScriptCore's garbage-collected heap) is reported as `not in libpas`.

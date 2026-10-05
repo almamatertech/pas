@@ -86,6 +86,8 @@ class Reader:
         self.fields = {}
         self.symbols = {}
         self.debug_info = self.target.FindFirstType("pas_segregated_page").IsValid()
+        # Core files keep memory but not memory tags, so tags there are unknown rather than absent.
+        self.core = "core" in (process.GetPluginName() or "")
         base = self.symbol("pas_compact_heap_reservation_base")
         self.compact_base = self.u64(base) if base else 0
 
@@ -555,9 +557,9 @@ def first_segregated_object(page, object_size):
     return left_first if left_end - left_first >= page.size - right_first else right_first
 
 
-def show_tags(tags):
+def show_tags(tags, core=False):
     if tags is None:
-        return "not tagged"
+        return "unknown" if core else "not tagged"
     if len(tags) > 8 and len(set(tags)) == 1:
         return f"{tags[0]:x} x{len(tags)}"
     text = " ".join(f"{tag:x}" for tag in tags[:8])
@@ -614,6 +616,9 @@ def info(heap, arguments, out):
     begin, end = (row[0], row[0] + row[1]) if row else (address, address + 1)
     begin &= ~(TAG_GRANULE - 1)
     tags = heap.reader.tags(begin, end)
+    if tags is None and heap.reader.core:
+        out.append("memory    unknown, core files don't keep memory tags")
+        return
     out.append(f"memory    {show_tags(tags)}")
     if tags is None:
         out.append("result    address not tagged")
@@ -646,7 +651,7 @@ def page_listing(heap, arguments, out, around=8):
         own = None if tags is None else tags[(begin - shown[0][0]) // TAG_GRANULE:
                                               (begin + size - shown[0][0]) // TAG_GRANULE]
         marker = f"   <- {pointer:#018x}" if begin <= address < begin + size else ""
-        out.append(f"{begin:<#14x}{size:>8}  {state:<10} {show_tags(own)}{marker}")
+        out.append(f"{begin:<#14x}{size:>8}  {state:<10} {show_tags(own, heap.reader.core)}{marker}")
     out.append(f"({last - first} of {len(rows)} entries)")
     if any(state == "logged" for _, _, state in shown):
         out.append("(logged: freed, but waiting in a thread's deallocation log, see pas log)")
@@ -742,6 +747,9 @@ def explain(heap, arguments, out):
     tag = tag_of(pointer)
     page, rows, row = describe(heap, pointer, out)
     tags = heap.reader.tags(address & ~(TAG_GRANULE - 1), address + 1)
+    if tags is None and heap.reader.core:
+        out.append("result    unknown, core files don't keep memory tags, so pas can't compare them")
+        return
     if tags is None:
         out.append("result    address not tagged, so MTE doesn't check accesses to it")
         return
