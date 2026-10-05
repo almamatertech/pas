@@ -1,9 +1,11 @@
 #!/bin/bash
 # Runs pas against the test app and checks its output.
 #
-#   test/run.sh                         against the system JavaScriptCore, with MTE on and off
-#                                       (the MTE checks need an M5 or later Mac)
-#   test/run.sh <WebKitBuild/Release>   against a JavaScriptCore you built, which has no MTE
+#   test/run.sh                         against the system JavaScriptCore
+#   test/run.sh <WebKitBuild/Release>   against a JavaScriptCore you built
+#
+# Each run builds the test app with MTE off and on. The MTE half is skipped when the app's pointers
+# come back untagged: on a Mac without MTE (before M5), or with a JavaScriptCore built without it.
 set -euo pipefail
 cd "$(dirname "$0")"
 build=${1:+$(cd "$1" && pwd)}
@@ -49,13 +51,17 @@ stop_app() {
     wait "$pid" 2> /dev/null || true
 }
 
-variants=$([ -n "$build" ] && echo plain || echo "mte plain")
-for variant in $variants; do
+for variant in mte plain; do
     echo "== $variant${build:+ ($build)}"
     build_app "$variant"
     start_app
+    if [ "$variant" = mte ] && [ $(( $(address small) >> 56 )) -eq 0 ]; then
+        echo "  skipped: the app's pointers aren't tagged, so MTE isn't on"
+        stop_app
+        continue
+    fi
     if [ "$variant" = mte ]; then
-        check info small "Common Primitive (bmalloc)" "small bitfit, 16 KiB" "bytes, allocated" "tags match"
+        check info small "Common Primitive (" "small bitfit, 16 KiB" "bytes, allocated" "tags match"
         check info freed "bytes, free" "tags differ"
         check info medium "medium bitfit, 512 KiB" "bytes, allocated" "tags match"
         check info larger "medium bitfit, 512 KiB" "bytes, allocated" "tags match"

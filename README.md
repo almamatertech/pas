@@ -127,8 +127,10 @@ current thread stopped at. To load `pas` in every session, add the `command scri
   with that entitlement. Safari and other system processes need System Integrity Protection
   (SIP) turned off. To attach from SSH, or another session where macOS can't ask for your
   password, turn on developer mode with `sudo DevToolsSecurity -enable`.
-- For tags, a Mac with MTE (M5 or later) and a process with MTE enabled. JavaScriptCore built
-  from source with the public SDK doesn't use MTE, so there `pas` shows memory as `not tagged`.
+- For tags, a Mac with MTE (M5 or later) and a process with MTE enabled. JavaScriptCore built from
+  source with the public SDK leaves MTE off, so `pas` shows its memory as `not tagged`. To turn MTE
+  on in your build, see
+  [JavaScriptCore with MTE, from source](#javascriptcore-with-mte-from-source).
 
 ## How `pas` knows libpas's layout
 
@@ -153,14 +155,34 @@ libpas layouts change between releases.
 - `refs` only searches allocated libpas objects, not stacks, registers or other memory.
 - `explain` gives the likely cause from tags alone. A tag can match a neighbour by chance, so
   treat it as a lead.
-- The shipped build above puts tagged allocations in the `bmalloc` heap. `pas` reads
-  `tagged_bmalloc` the same way, but hasn't been tested against a process that uses it.
+
+## JavaScriptCore with MTE, from source
+
+JavaScriptCore built from source with the public SDK leaves MTE off, because libpas's MTE code
+includes two headers that only Apple's internal SDK has. `mte-headers/` has minimal versions of
+both. To build with MTE on, from a WebKit checkout:
+
+```
+WEBKIT_OUTPUTDIR=$PWD/WebKitBuild-MTE Tools/Scripts/build-jsc --release \
+    "OTHER_CFLAGS=\$(inherited) -DBENABLE_MTE=1 -DPAS_ENABLE_MTE=1 -isystem /path/to/pas/mte-headers"
+```
+
+Run a program against it with `DYLD_FRAMEWORK_PATH=WebKitBuild-MTE/Release`, signed with the
+entitlements in `test/mte.plist`, on a Mac with MTE. Its fastMalloc allocations then come from the
+`tagged_bmalloc` heap. This was tested with WebKit 814bf42b6770 on macOS 27.0.1. Apple's builds may
+set other MTE options differently.
 
 ## Testing
 
 `test/run.sh` builds a small program that allocates with `fastMalloc` and checks each command's
-output. Without arguments it uses the system JavaScriptCore, with MTE on and off; the MTE half,
-including real tag-check faults under LLDB, needs an MTE Mac. `test/run.sh <WebKitBuild/Release>`
-runs the same checks against JavaScriptCore you built.
+output, with MTE off and on. The MTE half includes real tag-check faults under LLDB, and is skipped
+when the program's pointers come back untagged. Without arguments the test uses the system
+JavaScriptCore, and `test/run.sh <WebKitBuild/Release>` uses one you built.
+
+On an M6 Mac running macOS 27.0.1, the tests pass against the system JavaScriptCore, whose MTE
+allocations live in the `bmalloc` heap, and against WebKit 814bf42b6770 built from source, both as
+is and [with MTE on](#javascriptcore-with-mte-from-source), where MTE allocations live in the
+`tagged_bmalloc` heap. Every command was also run against Safari's WebContent, GPU and Networking
+processes on the same Mac, with SIP off.
 
 Licensed under [MIT](LICENSE).
