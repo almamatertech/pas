@@ -30,6 +30,7 @@ a series on how WebKit uses MTE.
 | `refs <address>` | Allocated libpas objects that hold a pointer into the object at an address |
 | `log` | Each thread's recent frees that libpas hasn't returned to their pages yet |
 | `explain [address]` | Why a pointer's tag doesn't match its memory, and the likely bug |
+| `dump [--page] <address> <file>` | Writes the bytes of the object at an address, or of its whole page, to a file |
 
 ## Examples
 
@@ -120,6 +121,7 @@ From a shell, by process ID:
 ```
 pas.py <pid> info|page|refs|explain <address>
 pas.py <pid> heap|log
+pas.py <pid> dump [--page] <address> <file>
 ```
 
 `pas` attaches with LLDB, reads what it needs, and detaches. The process pauses while it does, for
@@ -142,6 +144,22 @@ current thread stopped at. To load `pas` in every session, add the `command scri
 `pas` also works on core files. Load one with `lldb -c <core> <program>` and import `pas` as above.
 macOS core files keep memory but not memory tags, so there `pas` shows tags as unknown and
 `explain` can't compare them.
+
+## Dumps
+
+`dump` writes the bytes of the object at an address to a file, from the object's first byte to its
+last. With `--page` it writes the object's whole page. Next to the file, the same name plus `.json`
+holds what `pas` knows about the bytes: where they came from, their heap and page, the objects in a
+dumped page, and the memory tag of every 16 bytes. Core files and plain memory dumps lose those
+tags, so this is the way to keep them with a copy of the memory.
+
+```
+$ pas 36620 dump 0xe00000112000000 medium.bin
+wrote the 3072-byte object at 0x112000000 (Common Primitive) to medium.bin
+its details and memory tags are in medium.bin.json
+$ jq -c '{dumped, size, heap, memory_tags: .memory_tags[:4]}' medium.bin.json
+{"dumped":"object","size":3072,"heap":"Common Primitive","memory_tags":[14,14,14,14]}
+```
 
 ## Requirements
 

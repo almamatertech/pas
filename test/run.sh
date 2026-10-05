@@ -23,9 +23,18 @@ expect() { # expect <output> <text>...
 
 address() { awk -v name="$1" '$1 == name { print $2 }' "$work/addresses.txt"; }
 
-check() { # check <command> <allocation> <expected text>...
-    local output
-    output=$(../pas.py "$pid" "$1" $([ -n "$2" ] && address "$2"))
+python_check() { # python_check <description> <python code> [arguments]...
+    local description=$1
+    shift
+    if python3 -c "$@"; then echo "  ok    $description"; else echo "  FAIL  $description"; failures=$((failures + 1)); fi
+}
+
+check() { # check <command> "[--page] <allocation> [file]" <expected text>...
+    local output words=() word
+    for word in $2; do
+        case $word in --page|/*) words+=("$word") ;; *) words+=("$(address "$word")") ;; esac
+    done
+    output=$(../pas.py "$pid" "$1" ${words[@]+"${words[@]}"})
     echo "$output"
     shift 2
     expect "$output" "$@"
@@ -79,6 +88,15 @@ for variant in mte plain; do
     check page small "<- $(printf '%#018x' "$(address small)")"
     check refs small "object $(printf '%#x' $(( $(address medium) & 0x00ffffffffffffff ))) +0x8" "(1 found)"
     check heap "" "Common Primitive" "total"
+    check dump "medium $work/medium.bin" "wrote the 3072-byte object at"
+    # The app stored a pointer to the small object at +8 in the medium one.
+    python_check "the dump holds the stored pointer, and its JSON file matches" '
+import json, sys
+data, about = open(sys.argv[1], "rb").read(), json.load(open(sys.argv[1] + ".json"))
+mask = (1 << 56) - 1
+assert len(data) == about["size"] == 3072 and about["dumped"] == "object"
+assert int.from_bytes(data[8:16], "little") & mask == int(sys.argv[2], 16) & mask' "$work/medium.bin" "$(address small)"
+    check dump "--page small $work/page.bin" "wrote the 16384-byte page at"
     stop_app
 
     if [ "$variant" = plain ]; then

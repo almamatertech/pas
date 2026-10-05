@@ -4,12 +4,15 @@
 Inside LLDB:    command script import pas.py
                 pas info|page|refs|explain <address>
                 pas heap|log
+                pas dump [--page] <address> <file>
                 pas explain               (at a tag-check fault)
 From a shell:   pas.py <pid> info|page|refs|explain <address>
                 pas.py <pid> heap|log
+                pas.py <pid> dump [--page] <address> <file>
 
 pas only reads memory. It never calls functions in the process or writes to it.
 """
+import json
 import re
 import struct
 import subprocess
@@ -792,6 +795,37 @@ def explain(heap, arguments, out):
         out.append("cause     the address isn't inside a libpas object")
 
 
+def dump(heap, arguments, out):
+    """Write the bytes of the object at an address, or of its whole page, to a file, and what pas knows
+    about them, with each 16-byte granule's memory tag, to the same name plus .json."""
+    pointer, path, whole_page = arguments
+    address = pointer & ADDRESS_MASK
+    page, rows, row = heap.locate(address)
+    if whole_page and not page:
+        raise LookupError("the address isn't in a libpas page")
+    if not whole_page and not row:
+        raise LookupError("the address isn't inside a libpas object")
+    begin, size = (page.boundary, page.size) if whole_page else row[:2]
+    name = heap.name(heap.owner(page)) if page else heap.name(heap.large_owner(row[3]))
+    memory = heap.reader.read(begin, size)
+    about = {"dumped": "page" if whole_page else "object", "begin": f"{begin:#x}", "size": size,
+             "pointer": f"{pointer:#018x}", "heap": name, "config": page.config.name if page else None,
+             "page": {"address": f"{page.boundary:#x}", "kind": page.name, "size": page.size} if page else None}
+    if row:
+        about["object"] = {"begin": f"{row[0]:#x}", "size": row[1], "state": row[2]}
+    if whole_page:
+        about["objects"] = [{"begin": f"{b:#x}", "size": s, "state": state} for b, s, state in rows]
+    # Addresses are hex strings, because many JSON tools can't hold a tagged pointer exactly as a number.
+    about["memory_tags"] = heap.reader.tags(begin, begin + size)
+    with open(path, "wb") as handle:
+        handle.write(memory)
+    with open(path + ".json", "w") as handle:
+        json.dump(about, handle)
+        handle.write("\n")
+    out.append(f"wrote the {size}-byte {about['dumped']} at {begin:#x} ({name}) to {path}")
+    out.append(f"its details and memory tags are in {path}.json")
+
+
 def fault_from_stop(target):
     """The faulting pointer and description, if the selected thread stopped at a tag-check fault."""
     thread = target.GetProcess().GetSelectedThread()
@@ -806,8 +840,11 @@ def fault_from_stop(target):
 
 
 COMMANDS = {"info": (info, 1), "page": (page_listing, 1), "refs": (refs, 1), "explain": (explain, 1),
-            "heap": (heap_walk, 0), "log": (deallocation_log, 0)}
-USAGE = "usage: pas info|page|refs|explain <address>, pas heap|log, or pas explain at a tag-check fault"
+            "heap": (heap_walk, 0), "log": (deallocation_log, 0), "dump": (dump, 1)}
+USAGE = ("usage: pas info|page|refs|explain <address>, pas heap|log, pas dump [--page] <address> <file>, "
+         "or pas explain at a tag-check fault")
+SHELL_USAGE = ("usage: pas.py <pid> info|page|refs|explain <address>, pas.py <pid> heap|log, "
+               "or pas.py <pid> dump [--page] <address> <file>")
 
 
 def check_build(reader, out):
@@ -827,7 +864,7 @@ def run(target, process, command, arguments, out):
         reader = Reader(target, process)
         check_build(reader, out)
         COMMANDS[command][0](Libpas(reader), arguments, out)
-    except (LookupError, LayoutError) as error:
+    except (LookupError, LayoutError, OSError) as error:
         out.append(f"error: {error}")
 
 
@@ -838,6 +875,16 @@ def lldb_command(debugger, text, result, _):
         result.SetError(USAGE)
         return
     command, expression = words[0], words[1] if len(words) > 1 else None
+    extra = []
+    if command == "dump":
+        whole_page = bool(expression) and expression.startswith("--page")
+        if whole_page:
+            expression = expression[len("--page"):].strip()
+        if not expression or len(expression.split()) < 2:
+            result.SetError(USAGE)
+            return
+        expression, path = expression.rsplit(None, 1)
+        extra = [path, whole_page]
     arguments = []
     if expression:
         frame = target.GetProcess().GetSelectedThread().GetSelectedFrame()
@@ -855,6 +902,7 @@ def lldb_command(debugger, text, result, _):
     if len(arguments) < COMMANDS[command][1]:
         result.SetError(USAGE)
         return
+    arguments += extra
     out = []
     run(target, target.GetProcess(), command, arguments, out)
     result.AppendMessage("\n".join(out))
@@ -865,9 +913,16 @@ def __lldb_init_module(debugger, _):
 
 
 def main(arguments):
-    if len(arguments) < 2 or arguments[1] not in COMMANDS or len(arguments) != 2 + COMMANDS[arguments[1]][1]:
-        sys.exit("usage: pas.py <pid> info|page|refs|explain <address>, or pas.py <pid> heap|log")
-    pid, command, values = int(arguments[0]), arguments[1], [int(value, 0) for value in arguments[2:]]
+    whole_page = arguments[1:3] == ["dump", "--page"]
+    if whole_page:
+        arguments = arguments[:2] + arguments[3:]
+    command = arguments[1] if len(arguments) > 1 else None
+    count = COMMANDS[command][1] + (command == "dump") if command in COMMANDS else -1
+    if not arguments or not arguments[0].isdigit() or len(arguments) != 2 + count:
+        sys.exit(SHELL_USAGE)
+    pid, values = int(arguments[0]), [int(value, 0) for value in arguments[2:2 + COMMANDS[command][1]]]
+    if command == "dump":
+        values += [arguments[3], whole_page]
     debugger = lldb.SBDebugger.Create()
     debugger.SetAsync(False)
     target = debugger.CreateTarget("")
