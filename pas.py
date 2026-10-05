@@ -3,10 +3,10 @@
 
 Inside LLDB:    command script import pas.py
                 pas info|page|refs|explain <address>
-                pas heap
+                pas heap|log
                 pas explain               (at a tag-check fault)
 From a shell:   pas.py <pid> info|page|refs|explain <address>
-                pas.py <pid> heap
+                pas.py <pid> heap|log
 
 pas only reads memory. It never calls functions in the process or writes to it.
 """
@@ -49,6 +49,9 @@ LAYOUT = {
     "pas_large_map": {"large_map_hashtable": 0x0, "small_large_map_hashtable": 0x38, "tiny_large_map_hashtable": 0x70},
     "pas_large_map_hashtable": {"table": 0x0, "table_size": 0x8},
     "pas_first_level_tiny_large_map_entry": {"hashtable": 0x8},
+    "pas_thread_local_cache_node": {"next": 0x8, "cache": 0x18},
+    "pas_thread_local_cache": {"deallocation_log": 0x0, "deallocation_log_index": 0x320, "node": 0x330,
+                               "thread": 0x348},
 }
 SIZES = {"bmalloc_type": 0x10, "pas_large_map": 0xc8, "pas_large_map_entry": 0x20, "pas_small_large_map_entry": 0xc,
          "pas_tiny_large_map_entry": 0x5, "pas_first_level_tiny_large_map_entry": 0x10}
@@ -59,6 +62,8 @@ TAG_READ_LIMIT = 1024 * TAG_GRANULE  # debugserver returns at most 1024 tags per
 MEGAPAGE_SHIFT = 24
 MIN_ALIGN_SHIFT = 4  # PAS_MIN_ALIGN_SHIFT, used by the packed large map entries
 EXC_ARM_MTE_TAGCHECK_FAIL = 0x106
+LOG_ADDRESS_MASK = (1 << 48) - 1  # deallocation log entries keep the page config kind above bit 48
+LOG_LIMIT = 1024  # PAS_DEALLOCATION_LOG_SIZE is 100, so a much larger index isn't real
 
 HEAP_CONFIGS = ("bmalloc", "tagged_bmalloc")
 # pas_page_kind values and the heap config member that describes each kind of page.
@@ -230,6 +235,8 @@ class Libpas:
         if not self.configs:
             raise LookupError("libpas's bmalloc heap isn't in this process")
         self.large = None
+        self.logs = None
+        self.logged_objects = None
         self.full_heaps = set()
 
     # Finding pages.
@@ -434,8 +441,53 @@ class Libpas:
         while offset + object_size <= page.size:
             index = offset >> page.shift
             state = "allocated" if bits[index // 8] >> (index % 8) & 1 else "free"
+            if state == "allocated" and page.boundary + offset in self.logged():
+                state = "logged"
             yield page.boundary + offset, object_size, state
             offset += object_size
+
+    def deallocation_logs(self):
+        """(thread, object addresses newest first) for each thread cache's pending frees.
+
+        Freeing an object on a segregated page appends it to the thread's deallocation log, and libpas
+        updates the page in batches. Until then the page still marks the object allocated."""
+        if self.logs is None:
+            self.logs = list(self.read_deallocation_logs())
+        return self.logs
+
+    def read_deallocation_logs(self):
+        r = self.reader
+        first = r.symbol("pas_thread_local_cache_node_first")
+        node = r.u64(first) if first else 0
+        seen = set()
+        while node and node not in seen:
+            seen.add(node)
+            cache = r.u64(node + r.field("pas_thread_local_cache_node", "cache"))
+            if cache and r.u64(cache + r.field("pas_thread_local_cache", "node")) == node:
+                count = r.u32(cache + r.field("pas_thread_local_cache", "deallocation_log_index"))
+                if count <= LOG_LIMIT:
+                    log = r.read(cache + r.field("pas_thread_local_cache", "deallocation_log"), count * 8)
+                    entries = [word & LOG_ADDRESS_MASK for (word,) in struct.iter_unpack("<Q", log) if word]
+                    yield self.thread_name(r.u64(cache + r.field("pas_thread_local_cache", "thread"))), entries[::-1]
+            node = r.u64(node + r.field("pas_thread_local_cache_node", "next"))
+
+    def thread_name(self, pthread):
+        """LLDB's name for the thread behind a pthread_t. libpthread keeps the thread's ID in its
+        pthread struct, so pas looks for each LLDB thread's ID there."""
+        try:
+            words = set(word for (word,) in struct.iter_unpack("<Q", self.reader.read(pthread, 512)))
+        except LookupError:
+            words = set()
+        for thread in self.reader.process:
+            if thread.GetThreadID() in words:
+                return f"thread {thread.GetIndexID()}"
+        return f"pthread {pthread:#x}"
+
+    def logged(self):
+        """Object address -> thread, for objects waiting in a deallocation log."""
+        if self.logged_objects is None:
+            self.logged_objects = {begin: thread for thread, entries in self.deallocation_logs() for begin in entries}
+        return self.logged_objects
 
     def large_objects(self):
         """(begin, end, pas_large_heap*) for every large object in libpas's large maps."""
@@ -544,6 +596,8 @@ def describe(heap, pointer, out):
         out.append("heap      not in libpas (system malloc, a stack, or other memory)")
     if row:
         begin, size, state = row[:3]
+        if state == "logged":
+            state = f"freed, waiting in {heap.logged()[begin]}'s deallocation log"
         out.append(f"object    {begin:#x} - {begin + size:#x}   {size} bytes, {state}")
         out.append(f"offset    +{address - begin:#x}")
         if page and not page.bitfit and state == "allocated" and \
@@ -594,6 +648,8 @@ def page_listing(heap, arguments, out, around=8):
         marker = f"   <- {pointer:#018x}" if begin <= address < begin + size else ""
         out.append(f"{begin:<#14x}{size:>8}  {state:<10} {show_tags(own)}{marker}")
     out.append(f"({last - first} of {len(rows)} entries)")
+    if any(state == "logged" for _, _, state in shown):
+        out.append("(logged: freed, but waiting in a thread's deallocation log, see pas log)")
 
 
 def heap_walk(heap, arguments, out):
@@ -622,6 +678,21 @@ def heap_walk(heap, arguments, out):
     out.append(f"{'total':<{width}}  {sums[0]:>6} {sums[1]:>11} {sums[2]:>8} {sums[3]:>11} {sums[4]:>6}")
     out.append(f"({len(totals)} heap{'' if len(totals) == 1 else 's'}. Objects and bytes in use include large "
                "objects, which libpas keeps outside pages.)")
+
+
+def deallocation_log(heap, arguments, out):
+    """Each thread's freed objects that libpas hasn't returned to their pages yet."""
+    logs = heap.deallocation_logs()
+    for thread, entries in logs:
+        out.append(f"{thread}: {len(entries)} pending free{'' if len(entries) == 1 else 's'}")
+        for begin in entries:
+            page, _, row = heap.locate(begin)
+            detail = f"{row[1]} bytes   {heap.name(heap.owner(page))}, {page.name}" if page and row \
+                else "not in a libpas page"
+            out.append(f"  {begin:#x}   {detail}")
+    if not logs:
+        out.append("no libpas thread caches")
+    out.append("(newest first, and libpas returns these objects to their pages in batches)")
 
 
 def refs(heap, arguments, out, limit=100):
@@ -700,7 +771,10 @@ def explain(heap, arguments, out):
             out.append(f"cause     likely out of bounds: the {state} {size}-byte object at {begin:#x} has the "
                        f"pointer's tag, and the address is {how_far} {side} it")
             return
-    if row and row[2] == "free":
+    if row and row[2] == "logged":
+        out.append(f"cause     likely use after free: the object here was freed, and is waiting in "
+                   f"{heap.logged()[row[0]]}'s deallocation log")
+    elif row and row[2] == "free":
         out.append("cause     likely use after free: the object here is free, and libpas retagged its memory "
                    "when it was freed")
     elif row:
@@ -724,8 +798,8 @@ def fault_from_stop(target):
 
 
 COMMANDS = {"info": (info, 1), "page": (page_listing, 1), "refs": (refs, 1), "explain": (explain, 1),
-            "heap": (heap_walk, 0)}
-USAGE = "usage: pas info|page|refs|explain <address>, pas heap, or pas explain at a tag-check fault"
+            "heap": (heap_walk, 0), "log": (deallocation_log, 0)}
+USAGE = "usage: pas info|page|refs|explain <address>, pas heap|log, or pas explain at a tag-check fault"
 
 
 def check_build(reader, out):
@@ -784,7 +858,7 @@ def __lldb_init_module(debugger, _):
 
 def main(arguments):
     if len(arguments) < 2 or arguments[1] not in COMMANDS or len(arguments) != 2 + COMMANDS[arguments[1]][1]:
-        sys.exit("usage: pas.py <pid> info|page|refs|explain <address>, or pas.py <pid> heap")
+        sys.exit("usage: pas.py <pid> info|page|refs|explain <address>, or pas.py <pid> heap|log")
     pid, command, values = int(arguments[0]), arguments[1], [int(value, 0) for value in arguments[2:]]
     debugger = lldb.SBDebugger.Create()
     debugger.SetAsync(False)

@@ -28,6 +28,7 @@ a series on how WebKit uses MTE.
 | `page <address>` | The objects around an address in its page, with their tags |
 | `heap` | Every libpas heap in the process: pages, objects and bytes in use |
 | `refs <address>` | Allocated libpas objects that hold a pointer into the object at an address |
+| `log` | Each thread's recent frees that libpas hasn't returned to their pages yet |
 | `explain [address]` | Why a pointer's tag doesn't match its memory, and the likely bug |
 
 ## Examples
@@ -93,13 +94,32 @@ Heaps are named after their type. TZone, WebKit's way of keeping C++ types apart
 heaps, names its heaps, or buckets, with just a running number, on purpose. `pas` shows that number
 and the object size each bucket serves.
 
+Freeing an object on a segregated page doesn't update the page right away. libpas appends the
+object to the thread's deallocation log and returns logged objects to their pages in batches.
+Until then the page still marks the object allocated. So `pas` reads the logs too. `info`, `page`,
+`heap`, `refs` and `explain` treat a logged object as freed, and `log` lists them:
+
+```
+(lldb) pas log
+thread 1: 1 pending free
+  0x1100004e0   32 bytes   Common Primitive, small segregated
+(newest first, and libpas returns these objects to their pages in batches)
+(lldb) pas info *(void**)&last_freed
+...
+object    0x1100004e0 - 0x110000500   32 bytes, freed, waiting in thread 1's deallocation log
+```
+
+libpas's background cleanup thread, the scavenger, empties idle threads' logs within moments, so
+the log is most useful from a breakpoint or a crash, where the process stopped right after the
+free.
+
 ## Usage
 
 From a shell, by process ID:
 
 ```
 pas.py <pid> info|page|refs|explain <address>
-pas.py <pid> heap
+pas.py <pid> heap|log
 ```
 
 `pas` attaches with LLDB, reads what it needs, and detaches. The process pauses while it does, for
@@ -135,9 +155,9 @@ current thread stopped at. To load `pas` in every session, add the `command scri
 ## How `pas` knows libpas's layout
 
 `pas` finds things the way libpas does. It finds a page through libpas's lookup tables, the
-objects in it through the page's bits, its heap through the page's owner, and objects outside
-pages through libpas's table of large objects. It reads page sizes from libpas's heap settings
-in the process.
+objects in it through the page's bits, its heap through the page's owner, objects outside pages
+through libpas's table of large objects, and objects freed but not yet returned through each
+thread's deallocation log. It reads page sizes from libpas's heap settings in the process.
 
 For struct layouts, `pas` uses the build's debug info when it has some, as JavaScriptCore built
 from source does. Shipped builds have none, so `pas` falls back to a built-in table checked against

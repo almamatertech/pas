@@ -81,6 +81,18 @@ for variant in mte plain; do
     check heap "" "Common Primitive" "total"
     stop_app
 
+    if [ "$variant" = plain ]; then
+        # Frees on segregated pages wait in the thread's deallocation log, so break right after one.
+        echo "== $variant, deallocation log under LLDB"
+        start_app deallocation-log
+        output=$(perl -e 'alarm 60; exec @ARGV' xcrun lldb --batch -p "$pid" -o "command script import ../pas.py" \
+            -o "breakpoint set -n checkpoint" -o continue -o "pas log" -o "pas info *(void**)&last_freed" \
+            -o "process kill" 2>&1 | sed -n '/^(lldb) pas log/,$p')
+        echo "$output"
+        expect "$output" "1 pending free" "Common Primitive, small segregated" "freed, waiting in thread 1's deallocation log"
+        stop_app
+    fi
+
     if [ "$variant" = mte ]; then
         for mode in use-after-free out-of-bounds; do
             echo "== $variant, $mode under LLDB"
