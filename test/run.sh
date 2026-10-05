@@ -1,48 +1,92 @@
 #!/bin/bash
-# Builds the test app with MTE on and off, runs pas on each by PID, and checks the output.
-# Needs a Mac with MTE (M5 or later) for the tag checks.
+# Runs pas against the test app and checks its output.
+#
+#   test/run.sh                         against the system JavaScriptCore, with MTE on and off
+#                                       (the MTE checks need an M5 or later Mac)
+#   test/run.sh <WebKitBuild/Release>   against a JavaScriptCore you built, which has no MTE
 set -euo pipefail
 cd "$(dirname "$0")"
+build=${1:+$(cd "$1" && pwd)}
 work=$(mktemp -d)
 trap 'kill $(jobs -p) 2> /dev/null || true; rm -rf "$work"' EXIT
 failures=0
 
-address() { awk -v name="$1" '$1 == name { print $2 }' "$work/addresses.txt"; }
-
-check() { # check info|page <allocation> <expected text>...
-    local output
-    output=$(../pas.py "$pid" "$1" "$(address "$2")")
-    echo "$output"
-    shift 2
+expect() { # expect <output> <text>...
+    local output=$1
+    shift
     for text in "$@"; do
         if grep -qF -- "$text" <<< "$output"; then echo "  ok    $text"; else echo "  FAIL  $text"; failures=$((failures + 1)); fi
     done
 }
 
-for variant in mte plain; do
-    echo "== $variant"
-    xcrun clang -arch arm64e -O1 app.c -framework JavaScriptCore -o "$work/app"
-    codesign -s - -f --entitlements "$variant.plist" "$work/app" 2> /dev/null
-    "$work/app" > "$work/addresses.txt" &
+address() { awk -v name="$1" '$1 == name { print $2 }' "$work/addresses.txt"; }
+
+check() { # check <command> <allocation> <expected text>...
+    local output
+    output=$(../pas.py "$pid" "$1" $([ -n "$2" ] && address "$2"))
+    echo "$output"
+    shift 2
+    expect "$output" "$@"
+}
+
+build_app() { # build_app <entitlements>
+    if [ -n "$build" ]; then
+        xcrun clang -arch arm64 -O1 app.c -F "$build" -framework JavaScriptCore -o "$work/app"
+    else
+        xcrun clang -arch arm64e -O1 app.c -framework JavaScriptCore -o "$work/app"
+    fi
+    codesign -s - -f --entitlements "$1.plist" "$work/app" 2> /dev/null
+}
+
+start_app() { # start_app [mode]
+    DYLD_FRAMEWORK_PATH="$build" "$work/app" "$@" > "$work/addresses.txt" &
     pid=$!
     while [ "$(wc -l < "$work/addresses.txt")" -lt 6 ]; do sleep 0.1; done
+}
+
+stop_app() {
+    kill "$pid" 2> /dev/null || true
+    wait "$pid" 2> /dev/null || true
+}
+
+variants=$([ -n "$build" ] && echo plain || echo "mte plain")
+for variant in $variants; do
+    echo "== $variant${build:+ ($build)}"
+    build_app "$variant"
+    start_app
+    if [ "$variant" = mte ]; then
+        check info small "Common Primitive (bmalloc)" "small bitfit, 16 KiB" "bytes, allocated" "tags match"
+        check info freed "bytes, free" "tags differ"
+        check info medium "medium bitfit, 512 KiB" "bytes, allocated" "tags match"
+        check info larger "medium bitfit, 512 KiB" "bytes, allocated" "tags match"
+        check info large "(large object)" "bytes, allocated"
+        check explain freed "likely use after free"
+    else
+        check info small "Common Primitive (bmalloc)" "small segregated, 16 KiB" "bytes, allocated" "address not tagged"
+        check info freed "bytes, free"
+        check info medium "medium segregated, 128 KiB" "bytes, allocated"
+        check info larger "medium bitfit, 512 KiB" "bytes, allocated"
+        check info large "marge bitfit, 4 MiB" "bytes, allocated"
+        check explain freed "address not tagged"
+    fi
+    check info malloc "not in libpas"
+    check page small "<- $(printf '%#018x' "$(address small)")"
+    check refs small "object $(printf '%#x' $(( $(address medium) & 0x00ffffffffffffff ))) +0x8" "(1 found)"
+    check heap "" "Common Primitive" "total"
+    stop_app
 
     if [ "$variant" = mte ]; then
-        check info small "small bitfit page" "bytes, allocated" "tags match"
-        check info freed "bytes, free" "tags differ"
-        check info medium "medium bitfit page" "bytes, allocated" "tags match"
-        check info larger "medium bitfit page" "bytes, allocated" "tags match"
-    else
-        check info small "small segregated page" "bytes, allocated" "address not tagged"
-        check info freed "bytes, free"
-        check info medium "medium segregated page" "bytes, allocated"
-        check info larger "medium bitfit page" "bytes, allocated"
-        check info large "marge bitfit page" "bytes, allocated"
+        for mode in use-after-free out-of-bounds; do
+            echo "== $variant, $mode under LLDB"
+            start_app "$mode"
+            # perl's alarm limits the run to a minute in case LLDB doesn't return.
+            output=$(perl -e 'alarm 60; exec @ARGV' xcrun lldb --batch -p "$pid" -o "command script import ../pas.py" -o continue \
+                -k "pas explain" -k "process kill" 2>&1 | sed -n '/^fault /,/^cause /p')
+            echo "$output"
+            expect "$output" "EXC_ARM_MTE_TAG_FAULT" "likely ${mode//-/ }"
+            stop_app
+        done
     fi
-    check info malloc "not in a bmalloc page"
-    check page small "<- $(printf '%#018x' "$(address small)")"
-    kill "$pid"
-    wait "$pid" 2> /dev/null || true
 done
 
 [ "$failures" -eq 0 ] && echo "all checks passed" || { echo "$failures checks failed"; exit 1; }
